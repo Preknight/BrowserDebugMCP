@@ -1,0 +1,12 @@
+# 构建产物
+bin/
+obj/
+
+# 运行期数据：WebView2 浏览器缓存（几十 MB）、截图输出
+*.WebView2/
+webview2-data/
+screenshots/
+
+# 本地工具与用户设置
+.vs/
+*.user

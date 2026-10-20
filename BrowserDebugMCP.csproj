@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- Exe 而不是 WinExe：保留 stdin/stdout 管道（MCP 协议通道）与一个可读日志的控制台窗口。 -->
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <!-- WebView2 需要一个窗口宿主，因此引入 WPF；本工具不使用任何 XAML，窗口全部代码构造。 -->
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>BrowserDebugMCP</AssemblyName>
+    <RootNamespace>BrowserDebugMCP</RootNamespace>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 版本用浮动号取最新稳定版；若要锁定，替换为具体版本即可。 -->
+    <PackageReference Include="ModelContextProtocol" Version="*" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="*" />
+    <!-- WebView2 SDK：提供 CoreWebView2 的 CallDevToolsProtocolMethodAsync 与 GetDevToolsProtocolEventReceiver。 -->
+    <PackageReference Include="Microsoft.Web.WebView2" Version="*" />
+  </ItemGroup>
+
+</Project>
