@@ -20,6 +20,9 @@ internal sealed class WebViewHost : IDisposable
     private static readonly TimeSpan LoadTimeout = TimeSpan.FromSeconds(20);
     private static readonly TimeSpan CallTimeout = TimeSpan.FromSeconds(60);
 
+    private const int DefaultWindowWidth = 1280;
+    private const int DefaultWindowHeight = 880;
+
     // 同一时刻只允许一次"启动浏览器"；并发调用共享同一次启动。
     private readonly SemaphoreSlim _browserGate = new(1, 1);
 
@@ -33,8 +36,14 @@ internal sealed class WebViewHost : IDisposable
 
     private Dispatcher? _dispatcher;
     private CoreWebView2? _core;
+    private WebView2? _webView;
     private Window? _window;
     private Thread? _uiThread;
+
+    // 只在 UI 线程读写。窗口被关掉重建时沿用最近一次 resize 的结果，
+    // 否则尺寸会悄悄跳回默认值，调用方得再调一次才能恢复。
+    private int _windowWidth = DefaultWindowWidth;
+    private int _windowHeight = DefaultWindowHeight;
 
     // 由 Page.loadEventFired 推动；导航前先挂上等待，避免"事件先于等待到达"的竞态。
     private TaskCompletionSource? _pendingLoad;
@@ -109,12 +118,13 @@ internal sealed class WebViewHost : IDisposable
             var window = new Window
             {
                 Title = "BrowserDebugMCP — 正在初始化浏览器",
-                Width = 1280,
-                Height = 880,
+                Width = _windowWidth,
+                Height = _windowHeight,
                 Content = webView,
             };
             window.Closed += (_, _) => OnBrowserWindowClosed(window);
             _window = window;
+            _webView = webView;
             window.Show();
 
             // 显式指定 user data 目录：否则 WebView2 会用默认的 "<exe>.WebView2"。
@@ -153,6 +163,7 @@ internal sealed class WebViewHost : IDisposable
         if (!ReferenceEquals(_window, window)) return;
 
         _window = null;
+        _webView = null;
         _core = null;
         _receivers.Clear();
 
@@ -172,6 +183,67 @@ internal sealed class WebViewHost : IDisposable
             if (window is null) return false;
             window.Close();
             return true;
+        });
+    }
+
+    /// <summary>
+    /// 调整浏览器窗口尺寸（WPF DIP，含窗口边框）。参数为 null 表示沿用当前值；
+    /// 两者都为 null 时只回报当前尺寸。窗口尚未创建时会先建（与其他工具一致）。
+    /// </summary>
+    public async Task<(int Width, int Height)> ResizeBrowserAsync(
+        int? width,
+        int? height,
+        CancellationToken cancellationToken = default)
+    {
+        await EnsureBrowserAsync(cancellationToken);
+
+        var dispatcher = _dispatcher ?? throw new InvalidOperationException("UI 线程尚未启动");
+
+        return await dispatcher.InvokeAsync(() =>
+        {
+            var window = _window ?? throw new InvalidOperationException("浏览器窗口尚未就绪（可能刚被关闭），请重试");
+
+            if (width is not null || height is not null)
+            {
+                if (width is { } newWidth) _windowWidth = newWidth;
+                if (height is { } newHeight) _windowHeight = newHeight;
+
+                // 最大化时设置 Width/Height 不生效，先还原成普通窗口，尺寸才真的会变。
+                if (window.WindowState == WindowState.Maximized) window.WindowState = WindowState.Normal;
+
+                window.Width = _windowWidth;
+                window.Height = _windowHeight;
+                window.UpdateLayout();
+            }
+
+            return (_windowWidth, _windowHeight);
+        });
+    }
+
+    /// <summary>
+    /// 用 Win32 抓 WebView2 控件窗口的真实像素（PrintWindow，失败时 BitBlt 屏幕兜底）。
+    /// 与 CDP 的 Page.captureScreenshot 不同：这条路径拿的是窗口像素，能反映窗口被遮挡、
+    /// 缩放后的实际样子，但要求窗口没被最小化。
+    /// </summary>
+    public async Task<WindowCapture.Result> CaptureWindowAsync(CancellationToken cancellationToken = default)
+    {
+        await EnsureBrowserAsync(cancellationToken);
+
+        var dispatcher = _dispatcher ?? throw new InvalidOperationException("UI 线程尚未启动");
+
+        // 必须在 UI 线程调用：PrintWindow 会同步给目标窗口发 WM_PRINT，
+        // 跨线程发同步消息容易把两个线程一起卡住。
+        return await dispatcher.InvokeAsync(() =>
+        {
+            var window = _window ?? throw new InvalidOperationException("浏览器窗口尚未就绪（可能刚被关闭），请重试");
+            var webView = _webView ?? throw new InvalidOperationException("浏览器窗口尚未就绪（可能刚被关闭），请重试");
+
+            // IsIconic 只对顶层窗口有意义，子窗口的 HWND 不会带最小化状态，
+            // 所以最小化与否要看宿主 Window 的状态，否则会抓到一张黑图或桌面。
+            if (window.WindowState == WindowState.Minimized)
+                throw new InvalidOperationException("窗口已最小化，截不到画面；请先恢复窗口再调用");
+
+            return WindowCapture.Capture(webView.Handle);
         });
     }
 

@@ -14,6 +14,10 @@ internal sealed class BrowserTools(BrowserSession session)
 {
     private const int MaxHtmlLength = 60_000;
 
+    // 窗口尺寸的合理边界：太小会让页面布局失真，太大在普通显示器上会被系统裁掉。
+    private const int MinWindowSize = 200;
+    private const int MaxWindowSize = 10_000;
+
     [McpServerTool(Name = "open")]
     [Description("在受控浏览器里打开一个 URL，并等待页面 load 事件（最多 20 秒）。")]
     public Task<string> Open(
@@ -114,6 +118,20 @@ internal sealed class BrowserTools(BrowserSession session)
         return path;
     }
 
+    [McpServerTool(Name = "screenshot_window")]
+    [Description("截取 WebView2 窗口本身的真实像素（Win32 PrintWindow，抓不到时回退到屏幕 BitBlt），保存为 PNG 并返回路径。与 screenshot 的区别：screenshot 走 CDP 取页面渲染帧；本工具抓窗口像素，因此能反映窗口被遮挡/缩放后的实际样子。窗口最小化时无法截取；被完全遮挡时只能拿到遮挡物。")]
+    public async Task<string> ScreenshotWindow(
+        [Description("可选文件名；省略则按时间戳生成。只会取文件名，不接受路径")] string? fileName = null,
+        CancellationToken cancellationToken = default)
+    {
+        var capture = await session.Host.CaptureWindowAsync(cancellationToken);
+
+        var path = Path.Combine(session.ScreenshotDir, SanitizeFileName(fileName, "window"));
+        await File.WriteAllBytesAsync(path, capture.Png, cancellationToken);
+
+        return $"{path}（{capture.Width}×{capture.Height} 物理像素，{capture.Method}）";
+    }
+
     [McpServerTool(Name = "cdp")]
     [Description("直接调用任意 DevTools Protocol 方法（逃生舱），返回原始 JSON。例如 method=Accessibility.getFullAXTree、method=Performance.getMetrics。")]
     public Task<string> Cdp(
@@ -133,6 +151,26 @@ internal sealed class BrowserTools(BrowserSession session)
         return closed
             ? "浏览器窗口已关闭；服务仍在运行，下次调用工具时会重建窗口"
             : "当前没有打开的浏览器窗口";
+    }
+
+    [McpServerTool(Name = "resize_window")]
+    [Description("调整受控浏览器窗口的大小（单位 DIP，含窗口边框；页面视口会略小）。width / height 至少给一个，省略的一方沿用当前值；两个都不给则只回报当前尺寸。窗口还没打开时会先创建，且后续重建窗口会沿用这次尺寸。")]
+    public async Task<string> ResizeWindow(
+        [Description("窗口宽度（DIP），省略则沿用当前宽度")] int? width = null,
+        [Description("窗口高度（DIP），省略则沿用当前高度")] int? height = null,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateWindowDimension(width, "width");
+        ValidateWindowDimension(height, "height");
+
+        var (appliedWidth, appliedHeight) = await session.Host.ResizeBrowserAsync(width, height, cancellationToken);
+
+        if (width is null && height is null)
+            return $"当前窗口尺寸：{appliedWidth}×{appliedHeight}（DIP）{await DescribeViewportAsync(cancellationToken)}";
+
+        // 窗口外框已经变了，但 WebView2 的视口要等一次布局与合成才跟上，稍等一下再读才准。
+        await Task.Delay(120, cancellationToken);
+        return $"窗口已调整为 {appliedWidth}×{appliedHeight}（DIP）{await DescribeViewportAsync(cancellationToken)}";
     }
 
     [McpServerTool(Name = "click")]
@@ -406,10 +444,44 @@ internal sealed class BrowserTools(BrowserSession session)
         return raw;
     }
 
-    private static string SanitizeFileName(string? fileName)
+    /// <summary>resize_window 的回报用：读页面视口尺寸；读不到就省略这一段，不影响 resize 本身。</summary>
+    private async Task<string> DescribeViewportAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            var raw = await session.Host.CdpAsync(
+                "Runtime.evaluate",
+                "{\"expression\":\"[innerWidth, innerHeight]\",\"returnByValue\":true}",
+                cancellationToken);
+
+            using var document = JsonDocument.Parse(raw);
+            if (!document.RootElement.TryGetProperty("result", out var result)) return string.Empty;
+            if (!result.TryGetProperty("value", out var value) || value.ValueKind != JsonValueKind.Array) return string.Empty;
+            if (value.GetArrayLength() < 2) return string.Empty;
+
+            return $"，页面视口 {value[0].GetDouble():0}×{value[1].GetDouble():0}";
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            return string.Empty;
+        }
+    }
+
+    private static void ValidateWindowDimension(int? value, string name)
+    {
+        if (value is not { } dimension) return;
+        if (dimension is < MinWindowSize or > MaxWindowSize)
+            throw new InvalidOperationException($"{name} 必须在 {MinWindowSize}–{MaxWindowSize} 之间，收到 {dimension}");
+    }
+
+    private static string SanitizeFileName(string? fileName, string prefix = "shot")
     {
         var name = Path.GetFileName(fileName ?? string.Empty);
-        if (string.IsNullOrWhiteSpace(name)) name = $"shot-{DateTime.Now:yyyyMMdd-HHmmss}";
+        if (string.IsNullOrWhiteSpace(name)) name = $"{prefix}-{DateTime.Now:yyyyMMdd-HHmmss}";
         return name.EndsWith(".png", StringComparison.OrdinalIgnoreCase) ? name : name + ".png";
     }
 }
