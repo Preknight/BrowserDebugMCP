@@ -119,7 +119,7 @@ internal sealed class BrowserTools(BrowserSession session)
     }
 
     [McpServerTool(Name = "screenshot_window")]
-    [Description("截取 WebView2 窗口本身的真实像素（Win32 PrintWindow，抓不到时回退到屏幕 BitBlt），保存为 PNG 并返回路径。与 screenshot 的区别：screenshot 走 CDP 取页面渲染帧；本工具抓窗口像素，因此能反映窗口被遮挡/缩放后的实际样子。窗口最小化时无法截取；被完全遮挡时只能拿到遮挡物。")]
+    [Description("截取 WebView2 窗口本身的真实像素（Win32 PrintWindow，抓不到时回退到屏幕 BitBlt），保存为 PNG 并返回路径。与 screenshot 的区别：screenshot 走 CDP 取页面渲染帧；本工具抓窗口像素，因此能反映窗口被遮挡/缩放后的实际样子。窗口最小化或隐藏时无法截取；被完全遮挡时只能拿到遮挡物。")]
     public async Task<string> ScreenshotWindow(
         [Description("可选文件名；省略则按时间戳生成。只会取文件名，不接受路径")] string? fileName = null,
         CancellationToken cancellationToken = default)

@@ -223,7 +223,8 @@ internal sealed class WebViewHost : IDisposable
     /// <summary>
     /// 用 Win32 抓 WebView2 控件窗口的真实像素（PrintWindow，失败时 BitBlt 屏幕兜底）。
     /// 与 CDP 的 Page.captureScreenshot 不同：这条路径拿的是窗口像素，能反映窗口被遮挡、
-    /// 缩放后的实际样子，但要求窗口没被最小化。
+    /// 缩放后的实际样子，但要求窗口未被最小化或隐藏。
+    /// 注意：cancellationToken 只在排队到 UI 线程之前生效；委托一旦开始执行就会跑完。
     /// </summary>
     public async Task<WindowCapture.Result> CaptureWindowAsync(CancellationToken cancellationToken = default)
     {
@@ -233,18 +234,21 @@ internal sealed class WebViewHost : IDisposable
 
         // 必须在 UI 线程调用：PrintWindow 会同步给目标窗口发 WM_PRINT，
         // 跨线程发同步消息容易把两个线程一起卡住。
-        return await dispatcher.InvokeAsync(() =>
-        {
-            var window = _window ?? throw new InvalidOperationException("浏览器窗口尚未就绪（可能刚被关闭），请重试");
-            var webView = _webView ?? throw new InvalidOperationException("浏览器窗口尚未就绪（可能刚被关闭），请重试");
+        return await dispatcher.InvokeAsync(
+            () =>
+            {
+                var window = _window ?? throw new InvalidOperationException("浏览器窗口尚未就绪（可能刚被关闭），请重试");
+                var webView = _webView ?? throw new InvalidOperationException("浏览器窗口尚未就绪（可能刚被关闭），请重试");
 
-            // IsIconic 只对顶层窗口有意义，子窗口的 HWND 不会带最小化状态，
-            // 所以最小化与否要看宿主 Window 的状态，否则会抓到一张黑图或桌面。
-            if (window.WindowState == WindowState.Minimized)
-                throw new InvalidOperationException("窗口已最小化，截不到画面；请先恢复窗口再调用");
+                // IsIconic 只对顶层窗口有意义，子窗口的 HWND 不会带最小化状态，
+                // 所以最小化与否要看宿主 Window 的状态，否则会抓到一张黑图或桌面。
+                if (window.WindowState == WindowState.Minimized)
+                    throw new InvalidOperationException("窗口已最小化，截不到画面；请先恢复窗口再调用");
 
-            return WindowCapture.Capture(webView.Handle);
-        });
+                return WindowCapture.Capture(webView.Handle);
+            },
+            DispatcherPriority.Normal,
+            cancellationToken);
     }
 
     /// <summary>导航并等待 load 事件（或超时）。</summary>

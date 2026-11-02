@@ -23,6 +23,9 @@ internal static class WindowCapture
     private const uint PwRenderFullContent = 0x00000002;
     private const uint SrcCopy = 0x00CC0020;
 
+    // SelectObject 失败时返回 NULL，(HGDIOBJ)-1 表示区域对象相关的错误。
+    private static readonly IntPtr HgdiError = new(-1);
+
     internal readonly record struct Result(byte[] Png, int Width, int Height, string Method);
 
     /// <summary>抓取窗口。必须在窗口所属的 UI 线程上调用：PrintWindow 会同步给目标窗口发消息。</summary>
@@ -34,6 +37,10 @@ internal static class WindowCapture
         // 调用方（WebViewHost.CaptureWindowAsync）另外检查宿主 Window 的 WindowState。
         if (IsIconic(hwnd))
             throw new InvalidOperationException("窗口已最小化，截不到画面；请恢复窗口后再调用");
+
+        // 隐藏的窗口 PrintWindow 只能拿到空图，BitBlt 也只会拷到桌面。
+        if (!IsWindowVisible(hwnd))
+            throw new InvalidOperationException("窗口当前不可见（已隐藏），截不到画面");
 
         if (!GetWindowRect(hwnd, out var rect))
             throw new InvalidOperationException("读取窗口尺寸失败（GetWindowRect）");
@@ -58,17 +65,35 @@ internal static class WindowCapture
     {
         pixels = [];
 
-        var hdc = CreateCompatibleDC(IntPtr.Zero);
-        if (hdc == IntPtr.Zero) return false;
+        // 位图格式必须取自屏幕 DC：CreateCompatibleDC(NULL) 的内存 DC 默认只选着 1×1 单色位图，
+        // 拿它当 CreateCompatibleBitmap 的格式来源会得到 1bpp 位图，PrintWindow 的结果就变成黑白失真图。
+        var screenDc = GetDC(IntPtr.Zero);
+        if (screenDc == IntPtr.Zero) return false;
 
-        var bitmap = CreateCompatibleBitmap(hdc, width, height);
+        var hdc = CreateCompatibleDC(screenDc);
+        if (hdc == IntPtr.Zero)
+        {
+            ReleaseDC(IntPtr.Zero, screenDc);
+            return false;
+        }
+
+        var bitmap = CreateCompatibleBitmap(screenDc, width, height);
         if (bitmap == IntPtr.Zero)
         {
             DeleteDC(hdc);
+            ReleaseDC(IntPtr.Zero, screenDc);
             return false;
         }
 
         var previous = SelectObject(hdc, bitmap);
+        if (previous == IntPtr.Zero || previous == HgdiError)
+        {
+            DeleteObject(bitmap);
+            DeleteDC(hdc);
+            ReleaseDC(IntPtr.Zero, screenDc);
+            return false;
+        }
+
         try
         {
             if (!PrintWindow(hwnd, hdc, PwRenderFullContent)) return false;
@@ -80,6 +105,7 @@ internal static class WindowCapture
             SelectObject(hdc, previous);
             DeleteObject(bitmap);
             DeleteDC(hdc);
+            ReleaseDC(IntPtr.Zero, screenDc);
         }
     }
 
@@ -104,6 +130,14 @@ internal static class WindowCapture
         }
 
         var previous = SelectObject(hdc, bitmap);
+        if (previous == IntPtr.Zero || previous == HgdiError)
+        {
+            DeleteObject(bitmap);
+            DeleteDC(hdc);
+            ReleaseDC(IntPtr.Zero, screenDc);
+            return null;
+        }
+
         try
         {
             if (!BitBlt(hdc, 0, 0, width, height, screenDc, rect.Left, rect.Top, SrcCopy)) return null;
@@ -184,6 +218,9 @@ internal static class WindowCapture
 
     [DllImport("user32.dll")]
     private static extern bool IsIconic(IntPtr hwnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool IsWindowVisible(IntPtr hwnd);
 
     [DllImport("user32.dll")]
     private static extern IntPtr GetDC(IntPtr hwnd);

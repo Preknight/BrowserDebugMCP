@@ -82,7 +82,7 @@ command = "C:\\path\\to\\BrowserDebugMCP\\bin\\Release\\net10.0-windows\\Browser
 两个截图工具的分工：
 
 - `screenshot` 走 CDP，取的是**页面视口渲染帧**——干净、不受窗口遮挡影响，但窗口最小化时可能返回空白或旧帧。
-- `screenshot_window` 走 Win32，抓的是 **WebView2 控件窗口的真实像素**（尺寸按物理像素），能反映窗口被遮挡/缩放后的实际样子；窗口最小化时直接报错，被完全遮挡时只能拿到遮挡物。
+- `screenshot_window` 走 Win32，抓的是 **WebView2 控件窗口的真实像素**（尺寸按物理像素），能反映窗口被遮挡/缩放后的实际样子；窗口最小化或隐藏时直接报错，被完全遮挡时只能拿到遮挡物。
 
 `cdp` 是兜底手段：任何没有单独封装的能力（`Accessibility.getFullAXTree`、`Performance.getMetrics`、`Emulation.setDeviceMetricsOverride`……）都能直接调用。
 
@@ -138,7 +138,7 @@ command = "C:\\path\\to\\BrowserDebugMCP\\bin\\Release\\net10.0-windows\\Browser
 - **`click` 只接受 CSS 选择器**，不支持按坐标点击；需要坐标就用 `cdp` 调 `Input.dispatchMouseEvent`。
 - **`press` 未映射组合键**（Ctrl/Shift/Alt 修饰符），需要时用 `cdp` 直通。
 - **不是真实 Edge 进程**：扩展、部分企业策略、`Target` 域的部分能力不同（渲染引擎同版本）。
-- **窗口最小化/完全遮挡时的截图**：`screenshot` 可能返回空白或旧帧；`screenshot_window` 在最小化时直接报错，被完全遮挡时抓到的只是遮挡物（`PrintWindow` 对 Chromium 的 GPU 合成层也并非总能成功，会回退 `BitBlt`）。
+- **窗口最小化/隐藏/完全遮挡时的截图**：`screenshot` 可能返回空白或旧帧；`screenshot_window` 在最小化或隐藏时直接报错，被完全遮挡时抓到的只是遮挡物（`PrintWindow` 对 Chromium 的 GPU 合成层也并非总能成功，会回退 `BitBlt`）。
 - **`resize_window` 只改真实窗口外框**（DIP），不模拟设备像素比或移动端视口；要精确控制视口/DPR 用 `cdp` 调 `Emulation.setDeviceMetricsOverride`，也不需要最大化、全屏这类窗口状态。
 
 ## 验证状态
