@@ -104,9 +104,11 @@ internal sealed class BrowserGateway : IBrowserHost, IDisposable
             throw new BrowserBusyException(DescribeBusy());
         }
 
-        Interlocked.Exchange(ref _busySinceMilliseconds, Environment.TickCount64);
         try
         {
+            // 放进 try 里：之后无论哪一步抛异常，finally 都会把它清零。
+            Interlocked.Exchange(ref _busySinceMilliseconds, Environment.TickCount64);
+
             var backend = Volatile.Read(ref _backend) ?? throw new InvalidOperationException("浏览器后端尚未初始化");
 
             try
