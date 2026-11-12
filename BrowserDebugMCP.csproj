@@ -11,7 +11,11 @@
     <LangVersion>latest</LangVersion>
     <AssemblyName>BrowserDebugMCP</AssemblyName>
     <RootNamespace>BrowserDebugMCP</RootNamespace>
-    <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- 不能开 InvariantGlobalization：WPF 的 TextBox 定位光标时会读“当前输入语言”
+         （InputLanguageSource.CurrentInputLanguage），invariant 模式下构造中文 2052 这类 culture
+         会抛 CultureNotFoundException，异常逃出 Dispatcher 后整个 UI 线程结束、窗口直接消失。
+         实测过一次：点一下地址栏，窗口就没了。 -->
+    <InvariantGlobalization>false</InvariantGlobalization>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
   </PropertyGroup>
 

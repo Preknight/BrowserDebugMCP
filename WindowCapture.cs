@@ -8,57 +8,94 @@ using System.Windows.Media.Imaging;
 namespace BrowserDebugMCP;
 
 /// <summary>
-/// 用 Win32 抓取 WebView2 控件窗口的**真实像素**，编码成 PNG。
+/// 截图的两条腿：WPF 自己渲染 chrome，Win32 抓网页，再合成成 PNG。
 ///
-/// 为什么不用 RenderTargetBitmap：WPF 的 WebView2 由 <c>HwndHost</c> 承载，
-/// 网页内容是独立的原生子窗口（WPF 的 airspace 限制），而 RenderTargetBitmap 只渲染
-/// WPF 视觉树，网页所在区域会是空白 —— 这正是这个类存在的原因。
-///
-/// 抓取顺序：先 <c>PrintWindow(PW_RENDERFULLCONTENT)</c>（支持被遮挡的窗口，也是
-/// Chromium 内容唯一可能被 WM_PRINT 拿到的形式）；失败或抓到整块黑图时，退回从屏幕
-/// 直接 <c>BitBlt</c>（要求窗口可见）。
+/// 为什么必须两边各取所长：
+/// - WPF 的 WebView2 由 <c>HwndHost</c> 承载，网页是独立原生子窗口（airspace），
+///   <c>RenderTargetBitmap</c> 只渲染 WPF 视觉树，网页区域会是空白；
+/// - 反过来，顶层窗口的 <c>PrintWindow(PW_RENDERFULLCONTENT)</c> 能拿到 Chromium 那块，
+///   但 WPF 用 D3D 画的内容（标签条、工具栏）拿不到。
 /// </summary>
 internal static class WindowCapture
 {
     private const uint PwRenderFullContent = 0x00000002;
-    private const uint SrcCopy = 0x00CC0020;
 
     // SelectObject 失败时返回 NULL，(HGDIOBJ)-1 表示区域对象相关的错误。
     private static readonly IntPtr HgdiError = new(-1);
 
     internal readonly record struct Result(byte[] Png, int Width, int Height, string Method);
 
-    /// <summary>抓取窗口。必须在窗口所属的 UI 线程上调用：PrintWindow 会同步给目标窗口发消息。</summary>
-    public static Result Capture(IntPtr hwnd)
+    /// <summary>
+    /// 抓"客户区完整画面"：WPF 的 chrome（标签条 + 工具栏）+ WebView2 里的网页。
+    ///
+    /// 为什么需要单独一条路径：加标签条/工具栏之后，顶层窗口的 PrintWindow 只能拿到
+    /// DWM 合成结果里 Chromium 那部分，WPF 自己用 D3D 画的内容会缺失（截出来是桌面底色）；
+    /// 而 RenderTargetBitmap 又渲染不了 WebView2（HwndHost / airspace，网页区域空白）。
+    /// 所以这里各取所长：RTB 画 chrome，PrintWindow 取网页，再按控件在客户区里的偏移拼起来。
+    ///
+    /// 输出不含窗口标题栏，尺寸按客户区的物理像素。
+    /// </summary>
+    public static Result CaptureComposite(FrameworkElement root, FrameworkElement webView, IntPtr webViewHandle)
     {
-        if (hwnd == IntPtr.Zero) throw new InvalidOperationException("拿不到 WebView2 的窗口句柄");
-
-        // 子窗口没有"最小化"状态，所以本检查只对顶层句柄有效；
-        // 调用方（WebViewHost.CaptureWindowAsync）另外检查宿主 Window 的 WindowState。
-        if (IsIconic(hwnd))
-            throw new InvalidOperationException("窗口已最小化，截不到画面；请恢复窗口后再调用");
-
-        // 隐藏的窗口 PrintWindow 只能拿到空图，BitBlt 也只会拷到桌面。
-        if (!IsWindowVisible(hwnd))
-            throw new InvalidOperationException("窗口当前不可见（已隐藏），截不到画面");
-
-        if (!GetWindowRect(hwnd, out var rect))
-            throw new InvalidOperationException("读取窗口尺寸失败（GetWindowRect）");
-
-        var width = rect.Right - rect.Left;
-        var height = rect.Bottom - rect.Top;
+        var dpi = VisualTreeHelper.GetDpi(root);
+        var width = (int)Math.Round(root.ActualWidth * dpi.DpiScaleX);
+        var height = (int)Math.Round(root.ActualHeight * dpi.DpiScaleY);
         if (width <= 0 || height <= 0)
-            throw new InvalidOperationException($"窗口尺寸无效：{width}×{height}");
+            throw new InvalidOperationException($"客户区尺寸无效：{width}×{height}");
 
-        if (TryPrintWindow(hwnd, width, height, out var pixels) && !LooksBlank(pixels))
-            return new Result(EncodePng(pixels, width, height), width, height, "PrintWindow");
+        // chrome 先渲染成位图：DrawingVisual 里没法直接画"视觉树的渲染结果"。
+        var chrome = new RenderTargetBitmap(width, height, 96 * dpi.DpiScaleX, 96 * dpi.DpiScaleY, PixelFormats.Pbgra32);
+        chrome.Render(root);
 
-        // 常见于 Chromium 的 GPU 合成层：PrintWindow 返回成功但内容是黑的。
-        // 退一步直接拷屏幕像素，代价是窗口必须可见（被完全遮挡时会拷到遮挡物）。
-        var blitted = CaptureWithBitBlt(rect, width, height)
-            ?? throw new InvalidOperationException("PrintWindow 与屏幕 BitBlt 都失败，无法截取窗口");
+        BitmapSource? page = null;
+        var method = "WPF 渲染（chrome；网页抓取失败，该区域为空白）";
 
-        return new Result(EncodePng(blitted, width, height), width, height, "BitBlt（屏幕像素）");
+        if (webViewHandle != IntPtr.Zero
+            && TryGetWindowSize(webViewHandle, out var pageWidth, out var pageHeight)
+            && TryPrintWindow(webViewHandle, pageWidth, pageHeight, out var pagePixels)
+            && !LooksBlank(pagePixels))
+        {
+            page = BitmapSource.Create(
+                pageWidth, pageHeight, 96, 96, PixelFormats.Bgra32, null,
+                WithOpaqueAlpha(pagePixels), pageWidth * 4);
+            page.Freeze();
+            method = "WPF 渲染（chrome）+ PrintWindow（网页）";
+        }
+
+        var visual = new DrawingVisual();
+        using (var dc = visual.RenderOpen())
+        {
+            dc.DrawImage(chrome, new Rect(0, 0, root.ActualWidth, root.ActualHeight));
+
+            if (page is not null)
+            {
+                // WebView2 控件在客户区里的位置（DIP），与 chrome 位图同一坐标系。
+                var offset = webView.TranslatePoint(new Point(0, 0), root);
+                dc.DrawImage(page, new Rect(offset.X, offset.Y, webView.ActualWidth, webView.ActualHeight));
+            }
+        }
+
+        var composite = new RenderTargetBitmap(width, height, 96 * dpi.DpiScaleX, 96 * dpi.DpiScaleY, PixelFormats.Pbgra32);
+        composite.Render(visual);
+        composite.Freeze();
+
+        var encoder = new PngBitmapEncoder();
+        encoder.Frames.Add(BitmapFrame.Create(composite));
+
+        using var stream = new MemoryStream();
+        encoder.Save(stream);
+        return new Result(stream.ToArray(), width, height, method);
+    }
+
+    private static bool TryGetWindowSize(IntPtr hwnd, out int width, out int height)
+    {
+        width = 0;
+        height = 0;
+        if (!GetWindowRect(hwnd, out var rect)) return false;
+
+        width = rect.Right - rect.Left;
+        height = rect.Bottom - rect.Top;
+        return width > 0 && height > 0;
     }
 
     private static bool TryPrintWindow(IntPtr hwnd, int width, int height, out byte[] pixels)
@@ -109,49 +146,6 @@ internal static class WindowCapture
         }
     }
 
-    private static byte[]? CaptureWithBitBlt(Win32Rect rect, int width, int height)
-    {
-        var screenDc = GetDC(IntPtr.Zero);
-        if (screenDc == IntPtr.Zero) return null;
-
-        var hdc = CreateCompatibleDC(screenDc);
-        if (hdc == IntPtr.Zero)
-        {
-            ReleaseDC(IntPtr.Zero, screenDc);
-            return null;
-        }
-
-        var bitmap = CreateCompatibleBitmap(screenDc, width, height);
-        if (bitmap == IntPtr.Zero)
-        {
-            DeleteDC(hdc);
-            ReleaseDC(IntPtr.Zero, screenDc);
-            return null;
-        }
-
-        var previous = SelectObject(hdc, bitmap);
-        if (previous == IntPtr.Zero || previous == HgdiError)
-        {
-            DeleteObject(bitmap);
-            DeleteDC(hdc);
-            ReleaseDC(IntPtr.Zero, screenDc);
-            return null;
-        }
-
-        try
-        {
-            if (!BitBlt(hdc, 0, 0, width, height, screenDc, rect.Left, rect.Top, SrcCopy)) return null;
-            return ReadPixels(bitmap, width, height);
-        }
-        finally
-        {
-            SelectObject(hdc, previous);
-            DeleteObject(bitmap);
-            DeleteDC(hdc);
-            ReleaseDC(IntPtr.Zero, screenDc);
-        }
-    }
-
     /// <summary>把 HBITMAP 读成 BGRA 字节；先把格式统一成 Bgra32，避免 24bpp 位图让 stride 算错。</summary>
     private static byte[] ReadPixels(IntPtr bitmap, int width, int height)
     {
@@ -172,7 +166,7 @@ internal static class WindowCapture
 
     /// <summary>
     /// 判断 PrintWindow 是否只抓到一块黑图。采样而非逐像素，避免大窗口上的额外开销；
-    /// 页面本身全黑时只会多走一次 BitBlt，不影响结果正确性。
+    /// 页面本身全黑时只会少贴一次网页位图，不影响 chrome 部分的正确性。
     /// </summary>
     private static bool LooksBlank(byte[] pixels)
     {
@@ -184,21 +178,14 @@ internal static class WindowCapture
         return true;
     }
 
-    private static byte[] EncodePng(byte[] pixels, int width, int height)
+    /// <summary>
+    /// GDI 抓来的位图 alpha 不可信（通常是 0），统一置为不透明，
+    /// 否则 PNG 保存出来会是全透明的一张图。
+    /// </summary>
+    private static byte[] WithOpaqueAlpha(byte[] pixels)
     {
-        // GDI 抓来的位图 alpha 不可信（BitBlt 通常是 0），统一置为不透明，
-        // 否则 PNG 保存出来会是全透明的一张图。
         for (var i = 3; i < pixels.Length; i += 4) pixels[i] = 255;
-
-        var bitmap = BitmapSource.Create(width, height, 96, 96, PixelFormats.Bgra32, null, pixels, width * 4);
-        bitmap.Freeze();
-
-        var encoder = new PngBitmapEncoder();
-        encoder.Frames.Add(BitmapFrame.Create(bitmap));
-
-        using var stream = new MemoryStream();
-        encoder.Save(stream);
-        return stream.ToArray();
+        return pixels;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -215,12 +202,6 @@ internal static class WindowCapture
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool GetWindowRect(IntPtr hwnd, out Win32Rect rect);
-
-    [DllImport("user32.dll")]
-    private static extern bool IsIconic(IntPtr hwnd);
-
-    [DllImport("user32.dll")]
-    private static extern bool IsWindowVisible(IntPtr hwnd);
 
     [DllImport("user32.dll")]
     private static extern IntPtr GetDC(IntPtr hwnd);
@@ -242,16 +223,4 @@ internal static class WindowCapture
 
     [DllImport("gdi32.dll")]
     private static extern bool DeleteDC(IntPtr hdc);
-
-    [DllImport("gdi32.dll")]
-    private static extern bool BitBlt(
-        IntPtr hdcDest,
-        int x,
-        int y,
-        int width,
-        int height,
-        IntPtr hdcSrc,
-        int srcX,
-        int srcY,
-        uint rop);
 }

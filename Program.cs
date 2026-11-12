@@ -29,11 +29,9 @@ var screenshotDir = ResolveScreenshotDir();
 // 不在这里预创建浏览器数据目录：浏览器是首次工具调用才建的，提前建只会留个空壳。
 Directory.CreateDirectory(screenshotDir);
 
-var consoleBuffer = new ConsoleBuffer();
-var networkBuffer = new NetworkBuffer();
-
 // 先选出单实例角色：宿主才创建 WebViewHost（仍然懒启动浏览器），代理只连管道。
-var gateway = new BrowserGateway(() => new WebViewHost(userDataFolder, consoleBuffer, networkBuffer));
+// console/network 缓冲现在按标签各自持有（见 BrowserTab），所以这里不用再建全局缓冲。
+var gateway = new BrowserGateway(() => new WebViewHost(userDataFolder));
 gateway.Initialize();
 
 var session = new BrowserSession(gateway, screenshotDir);

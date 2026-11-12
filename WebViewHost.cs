@@ -1,4 +1,5 @@
 using System.IO;
+using System.Net;
 using System.Windows;
 using System.Windows.Threading;
 using Microsoft.Web.WebView2.Core;
@@ -14,8 +15,15 @@ namespace BrowserDebugMCP;
 ///   也就是重新拉起进程 —— 用户会看到刚关掉的浏览器窗口又自己冒出来。
 /// - **浏览器窗口按需创建**：进程启动时不建窗口；第一次工具调用才建；
 ///   用户把窗口关掉就彻底销毁它（释放 WebView2 资源），进程继续待命，下次调用再建。
+///
+/// 窗口内可以有多个标签，每个标签是一块**独立的 WebView2 实例**（页面与 JS 状态互不干扰），
+/// 但同一时刻只展示一个：非活动标签用 Visibility.Collapsed 隐藏而不是移出视觉树，
+/// 因为 HwndHost 一旦离开视觉树就会销毁原生窗口、连带使 CoreWebView2 失效。
+///
+/// MCP 工具没有"标签"参数：所有工具都作用在**活动标签**上。切到哪个标签，
+/// open / evaluate / console / network 看到的就是哪个页面。
 /// </summary>
-internal sealed class WebViewHost : IBrowserHost, IDisposable
+internal sealed class WebViewHost : IBrowserHost, IBrowserWindowActions, IDisposable
 {
     private static readonly TimeSpan LoadTimeout = TimeSpan.FromSeconds(20);
     private static readonly TimeSpan CallTimeout = TimeSpan.FromSeconds(60);
@@ -23,20 +31,29 @@ internal sealed class WebViewHost : IBrowserHost, IDisposable
     private const int DefaultWindowWidth = 1280;
     private const int DefaultWindowHeight = 880;
 
+    /// <summary>
+    /// 默认页：首次建窗口的第一个标签、以及 `＋` / Ctrl+T 新建的标签都打开它。
+    /// 工具带明确 URL 时不走这里（直接把目标 URL 当初始页，省一次导航）。
+    /// </summary>
+    private const string DefaultHomeUrl = "https://www.bing.com/";
+
     // 同一时刻只允许一次"启动浏览器"；并发调用共享同一次启动。
     private readonly SemaphoreSlim _browserGate = new(1, 1);
 
-    // 必须长期持有 receiver 的引用：如果只是内联订阅，它会被 GC 回收，
-    // 之后原生层触发回调时会造成随机内存访问违例。
-    private readonly List<CoreWebView2DevToolsProtocolEventReceiver> _receivers = new();
-
     private readonly string _userDataFolder;
-    private readonly ConsoleBuffer _console;
-    private readonly NetworkBuffer _network;
+
+    // 只在 UI 线程增删。
+    private readonly List<BrowserTab> _tabs = new();
 
     private Dispatcher? _dispatcher;
-    private CoreWebView2? _core;
-    private WebView2? _webView;
+
+    // 环境只建一次，所有标签共享同一份缓存与网络栈。
+    private CoreWebView2Environment? _environment;
+    private BrowserWindowUi? _ui;
+
+    // 跨线程读（EnsureActiveTabAsync 在调用线程判断），仅在 UI 线程写。
+    private volatile BrowserTab? _activeTab;
+
     private Window? _window;
     private Thread? _uiThread;
 
@@ -45,15 +62,7 @@ internal sealed class WebViewHost : IBrowserHost, IDisposable
     private int _windowWidth = DefaultWindowWidth;
     private int _windowHeight = DefaultWindowHeight;
 
-    // 由 Page.loadEventFired 推动；导航前先挂上等待，避免"事件先于等待到达"的竞态。
-    private TaskCompletionSource? _pendingLoad;
-
-    public WebViewHost(string userDataFolder, ConsoleBuffer console, NetworkBuffer network)
-    {
-        _userDataFolder = userDataFolder;
-        _console = console;
-        _network = network;
-    }
+    public WebViewHost(string userDataFolder) => _userDataFolder = userDataFolder;
 
     /// <summary>启动常驻的 UI 线程。这时不创建浏览器 —— 窗口要等第一次工具调用。</summary>
     public void Start()
@@ -73,6 +82,15 @@ internal sealed class WebViewHost : IBrowserHost, IDisposable
         {
             _dispatcher = Dispatcher.CurrentDispatcher;
 
+            // 兜底：UI 线程上任何一个未处理异常都会让 Dispatcher.Run 直接返回，
+            // 线程一退出窗口就跟着消失 —— 表现为“浏览器自己关了”，而进程其实还活着。
+            // 所以这里记日志并标记已处理，让消息循环继续跑下去。
+            _dispatcher.UnhandledException += (_, e) =>
+            {
+                LogError("UI 线程未处理异常", e.Exception);
+                e.Handled = true;
+            };
+
             // 这里只跑消息循环。窗口按需创建，所以进程启动时不会弹任何窗口。
             Dispatcher.Run();
         }
@@ -82,25 +100,37 @@ internal sealed class WebViewHost : IBrowserHost, IDisposable
         }
     }
 
-    /// <summary>浏览器已可用就直接返回；尚未创建或已被关掉，则在 UI 线程上重建一个。</summary>
-    private async Task EnsureBrowserAsync(CancellationToken cancellationToken)
+    /// <summary>活动标签可用就直接返回；窗口未建或已被关掉，则在 UI 线程上重建一个（含首个标签）。</summary>
+    private async Task<BrowserTab> EnsureActiveTabAsync(CancellationToken cancellationToken) =>
+        (await EnsureActiveTabCoreAsync(cancellationToken, initialUrl: null)).Tab;
+
+    /// <summary>
+    /// 同 <see cref="EnsureActiveTabAsync(CancellationToken)"/>，但可以指定"窗口刚建时首个标签打开哪个页面"。
+    /// Created 表示这一轮是不是新建了窗口 —— 新建时已经导航过目标 URL，调用方可以据此省掉重复导航。
+    /// </summary>
+    private async Task<(BrowserTab Tab, bool Created)> EnsureActiveTabCoreAsync(
+        CancellationToken cancellationToken,
+        string? initialUrl)
     {
-        if (_core is not null) return;
+        if (_activeTab is { } existing) return (existing, false);
 
         await _browserGate.WaitAsync(cancellationToken);
         try
         {
-            if (_core is not null) return;
+            if (_activeTab is { } created) return (created, false);
 
-            var ready = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var ready = new TaskCompletionSource<BrowserTab>(TaskCreationOptions.RunContinuationsAsynchronously);
             var dispatcher = _dispatcher ?? throw new InvalidOperationException("UI 线程尚未启动");
+
+            // 默认页只在这里兜底；工具有明确目标 URL 时直接用目标 URL 当初始页。
+            var url = string.IsNullOrWhiteSpace(initialUrl) ? DefaultHomeUrl : initialUrl;
 
             // 必须有窗口且消息循环已在运行才能初始化 WebView2，所以把委托排队到 UI 线程；
             // 此时 Dispatcher.Run() 已经在处理消息，满足 EnsureCoreWebView2Async 的前提。
             // 故意不等待这个排队操作本身：启动的成败通过 ready 回报。
-            _ = dispatcher.InvokeAsync(() => _ = StartBrowserAsync(ready));
+            _ = dispatcher.InvokeAsync(() => _ = StartBrowserAsync(ready, url));
 
-            await ready.Task.WaitAsync(cancellationToken);
+            return (await ready.Task.WaitAsync(cancellationToken), true);
         }
         finally
         {
@@ -108,47 +138,31 @@ internal sealed class WebViewHost : IBrowserHost, IDisposable
         }
     }
 
-    private async Task StartBrowserAsync(TaskCompletionSource ready)
+    private async Task StartBrowserAsync(TaskCompletionSource<BrowserTab> ready, string initialUrl)
     {
         try
         {
             Directory.CreateDirectory(_userDataFolder);
 
-            var webView = new WebView2();
-            var window = new Window
+            if (_environment is null)
             {
-                Title = "BrowserDebugMCP — 正在初始化浏览器",
-                Width = _windowWidth,
-                Height = _windowHeight,
-                Content = webView,
-            };
-            window.Closed += (_, _) => OnBrowserWindowClosed(window);
-            _window = window;
-            _webView = webView;
-            window.Show();
+                // browserExecutableFolder 传 null = 复用系统已安装的 Runtime（与 Edge 同版本）。
+                _environment = await CoreWebView2Environment.CreateAsync(
+                    browserExecutableFolder: null,
+                    userDataFolder: _userDataFolder,
+                    options: null);
+            }
 
-            // 显式指定 user data 目录：否则 WebView2 会用默认的 "<exe>.WebView2"。
-            // browserExecutableFolder 传 null = 复用系统已安装的 Runtime（与 Edge 同版本）。
-            var environment = await CoreWebView2Environment.CreateAsync(
-                browserExecutableFolder: null,
-                userDataFolder: _userDataFolder,
-                options: null);
+            var ui = new BrowserWindowUi(this, _windowWidth, _windowHeight);
+            _ui = ui;
+            _window = ui.Window;
+            _window.Closed += (_, _) => OnBrowserWindowClosed(ui.Window);
 
-            await webView.EnsureCoreWebView2Async(environment);
-            _core = webView.CoreWebView2;
+            // 先 Show：EnsureCoreWebView2Async 要求应用消息循环已经在跑（README 坑 #7）。
+            ui.Window.Show();
 
-            // 重建时必须丢掉上一轮的 receiver，它们绑在已经销毁的核心对象上。
-            _receivers.Clear();
-            SubscribeProtocolEvents();
-
-            // 事件只有在对应 domain enable 之后才会到达，顺序不能反。
-            await CallCoreAsync("Runtime.enable", "{}");
-            await CallCoreAsync("Log.enable", "{}");
-            await CallCoreAsync("Page.enable", "{}");
-            await CallCoreAsync("Network.enable", "{}");
-
-            window.Title = "BrowserDebugMCP — about:blank";
-            ready.TrySetResult();
+            var tab = await CreateTabAsync(initialUrl);
+            ready.TrySetResult(tab);
         }
         catch (Exception exception)
         {
@@ -157,18 +171,140 @@ internal sealed class WebViewHost : IBrowserHost, IDisposable
         }
     }
 
-    /// <summary>窗口被关掉：只销毁浏览器，进程继续常驻等下一次调用。</summary>
+    /// <summary>在 UI 线程创建一个标签并激活它；url 为 about:blank 时只开空白页不导航。</summary>
+    private async Task<BrowserTab> CreateTabAsync(string url)
+    {
+        var ui = _ui ?? throw new InvalidOperationException("浏览器窗口尚未创建");
+        var environment = _environment ?? throw new InvalidOperationException("WebView2 环境尚未就绪");
+
+        var webView = new WebView2 { Visibility = Visibility.Collapsed };
+        var tab = new BrowserTab(webView);
+
+        ui.AttachContent(webView);
+
+        await webView.EnsureCoreWebView2Async(environment);
+        tab.Attach(webView.CoreWebView2);
+
+        // 网页焦点下的 F5/F12 交给 WebView2 原生处理：WPF 版的 WebView2 控件没有
+        // WinForms 那个 AcceleratorKeyPressed 事件，而网页是独立原生子窗口、
+        // 键盘消息不会冒泡到 WPF 窗口。关掉浏览器快捷键反而两头都不响应，所以显式保持开启。
+        tab.Core.Settings.AreBrowserAcceleratorKeysEnabled = true;
+
+        tab.StateChanged += OnTabStateChanged;
+        tab.NewWindowRequested += OnTabNewWindowRequested;
+
+        _tabs.Add(tab);
+        await EnableDomainsAsync(tab);
+
+        ActivateTabCore(tab);
+
+        if (!string.IsNullOrWhiteSpace(url) && !IsBlankUrl(url))
+        {
+            try
+            {
+                await NavigateTabAsync(tab, url, CancellationToken.None);
+            }
+            catch (Exception exception)
+            {
+                // 新标签打不开不该连累整个浏览器：留着这个标签，用户可在地址栏重试。
+                LogError($"新标签导航到 {url}", exception);
+            }
+        }
+
+        return tab;
+    }
+
+    private static async Task EnableDomainsAsync(BrowserTab tab)
+    {
+        // 事件只有在对应 domain enable 之后才会到达，顺序不能反。
+        await tab.Core.CallDevToolsProtocolMethodAsync("Runtime.enable", "{}");
+        await tab.Core.CallDevToolsProtocolMethodAsync("Log.enable", "{}");
+        await tab.Core.CallDevToolsProtocolMethodAsync("Page.enable", "{}");
+        await tab.Core.CallDevToolsProtocolMethodAsync("Network.enable", "{}");
+    }
+
+    /// <summary>切换活动标签：只改可见性，不动视觉树归属（见 BrowserTab 的说明）。</summary>
+    private void ActivateTabCore(BrowserTab tab)
+    {
+        if (!_tabs.Contains(tab)) return;
+
+        foreach (var candidate in _tabs)
+        {
+            candidate.WebView.Visibility = ReferenceEquals(candidate, tab)
+                ? Visibility.Visible
+                : Visibility.Collapsed;
+        }
+
+        _activeTab = tab;
+        tab.WebView.InvalidateVisual();
+        RefreshChrome();
+
+        // 让键盘输入直接进入网页（否则 F5 之类还得再点一下页面）。
+        tab.WebView.Focus();
+    }
+
+    private void CloseTabCore(BrowserTab tab)
+    {
+        var index = _tabs.IndexOf(tab);
+        if (index < 0) return;
+
+        _tabs.RemoveAt(index);
+        tab.StateChanged -= OnTabStateChanged;
+        tab.NewWindowRequested -= OnTabNewWindowRequested;
+
+        _ui?.DetachContent(tab.WebView);
+
+        var wasActive = ReferenceEquals(_activeTab, tab);
+        if (wasActive) _activeTab = null;
+        tab.Dispose();
+
+        if (_tabs.Count == 0)
+        {
+            // 关掉最后一个标签 = 关掉整个浏览器窗口（与真实浏览器一致）。
+            _window?.Close();
+            return;
+        }
+
+        if (wasActive) ActivateTabCore(_tabs[Math.Min(index, _tabs.Count - 1)]);
+        else RefreshChrome();
+    }
+
+    private void RefreshChrome()
+    {
+        if (_ui is null) return;
+
+        _ui.RenderTabStrip(_tabs, _activeTab);
+
+        if (_activeTab is { } tab)
+        {
+            _ui.SetAddress(tab.Url);
+            _ui.SetNavigationState(tab.CanGoBack, tab.CanGoForward);
+            if (_window is not null) _window.Title = $"BrowserDebugMCP — {tab.Title}";
+        }
+    }
+
+    private void OnTabStateChanged(BrowserTab tab) => RefreshChrome();
+
+    private void OnTabNewWindowRequested(BrowserTab source, string url) =>
+        FireAndForget(() => CreateTabAsync(url), "页面请求打开新窗口");
+
+    /// <summary>窗口被关掉：销毁所有标签，进程继续常驻等下一次调用。</summary>
     private void OnBrowserWindowClosed(Window window)
     {
         if (!ReferenceEquals(_window, window)) return;
 
         _window = null;
-        _webView = null;
-        _core = null;
-        _receivers.Clear();
+        _ui = null;
+        _activeTab = null;
 
-        // 让挂起的导航等待立刻结束，而不是干等到超时。
-        Interlocked.Exchange(ref _pendingLoad, null)?.TrySetResult();
+        foreach (var tab in _tabs.ToArray())
+        {
+            tab.StateChanged -= OnTabStateChanged;
+            tab.NewWindowRequested -= OnTabNewWindowRequested;
+            tab.Dispose();
+        }
+
+        _tabs.Clear();
     }
 
     /// <summary>显式关闭浏览器窗口（供 close_window 工具使用）。返回它此前是否开着。</summary>
@@ -187,7 +323,7 @@ internal sealed class WebViewHost : IBrowserHost, IDisposable
     }
 
     /// <summary>
-    /// 调整浏览器窗口尺寸（WPF DIP，含窗口边框）。参数为 null 表示沿用当前值；
+    /// 调整浏览器窗口尺寸（WPF DIP，含窗口边框与顶部工具栏）。参数为 null 表示沿用当前值；
     /// 两者都为 null 时只回报当前尺寸。窗口尚未创建时会先建（与其他工具一致）。
     /// </summary>
     public async Task<(int Width, int Height)> ResizeBrowserAsync(
@@ -195,7 +331,7 @@ internal sealed class WebViewHost : IBrowserHost, IDisposable
         int? height,
         CancellationToken cancellationToken = default)
     {
-        await EnsureBrowserAsync(cancellationToken);
+        await EnsureActiveTabAsync(cancellationToken);
 
         var dispatcher = _dispatcher ?? throw new InvalidOperationException("UI 线程尚未启动");
 
@@ -221,14 +357,13 @@ internal sealed class WebViewHost : IBrowserHost, IDisposable
     }
 
     /// <summary>
-    /// 用 Win32 抓 WebView2 控件窗口的真实像素（PrintWindow，失败时 BitBlt 屏幕兜底）。
-    /// 与 CDP 的 Page.captureScreenshot 不同：这条路径拿的是窗口像素，能反映窗口被遮挡、
-    /// 缩放后的实际样子，但要求窗口未被最小化或隐藏。
-    /// 注意：cancellationToken 只在排队到 UI 线程之前生效；委托一旦开始执行就会跑完。
+    /// 抓**客户区完整画面**：WPF 的标签条/工具栏 + 活动标签里的网页，拼成一张图（物理像素）。
+    /// 与 CDP 的 Page.captureScreenshot 不同：这条路径带 UI，能反映窗口被遮挡、缩放后的实际样子，
+    /// 但要求窗口未被最小化。只想看页面本身用 screenshot（走 CDP，交给页面视口渲染帧）。
     /// </summary>
     public async Task<WindowCapture.Result> CaptureWindowAsync(CancellationToken cancellationToken = default)
     {
-        await EnsureBrowserAsync(cancellationToken);
+        await EnsureActiveTabAsync(cancellationToken);
 
         var dispatcher = _dispatcher ?? throw new InvalidOperationException("UI 线程尚未启动");
 
@@ -238,72 +373,96 @@ internal sealed class WebViewHost : IBrowserHost, IDisposable
             () =>
             {
                 var window = _window ?? throw new InvalidOperationException("浏览器窗口尚未就绪（可能刚被关闭），请重试");
-                var webView = _webView ?? throw new InvalidOperationException("浏览器窗口尚未就绪（可能刚被关闭），请重试");
+                var tab = _activeTab ?? throw new InvalidOperationException("活动标签尚未就绪，请重试");
 
-                // IsIconic 只对顶层窗口有意义，子窗口的 HWND 不会带最小化状态，
-                // 所以最小化与否要看宿主 Window 的状态，否则会抓到一张黑图或桌面。
                 if (window.WindowState == WindowState.Minimized)
                     throw new InvalidOperationException("窗口已最小化，截不到画面；请先恢复窗口再调用");
 
-                return WindowCapture.Capture(webView.Handle);
+                // chrome 走 WPF 渲染、网页走 PrintWindow，再拼起来（见 WindowCapture.CaptureComposite）：
+                // 顶层窗口的 PrintWindow 拿不到 WPF 用 D3D 画出来的标签条/工具栏。
+                var root = window.Content as FrameworkElement
+                    ?? throw new InvalidOperationException("窗口内容不是可视元素，无法合成截图");
+
+                window.UpdateLayout();
+                return WindowCapture.CaptureComposite(root, tab.WebView, tab.WebView.Handle);
             },
             DispatcherPriority.Normal,
             cancellationToken);
     }
 
-    /// <summary>导航并等待 load 事件（或超时）。</summary>
+    /// <summary>导航活动标签并等待 load 事件（或超时）。</summary>
     public async Task<string> NavigateAsync(string url, CancellationToken cancellationToken = default)
     {
-        await EnsureBrowserAsync(cancellationToken);
+        // 窗口还没建时直接把目标 URL 当初始页：CreateTabAsync 已经等过 load 事件，
+        // 这里就不必再导航一次（否则会先开默认页再跳走，白等一轮）。
+        var (tab, created) = await EnsureActiveTabCoreAsync(cancellationToken, url);
+        if (created && SameUrl(tab.Url, url)) return url;
 
-        var load = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        Interlocked.Exchange(ref _pendingLoad, load);
+        return await NavigateTabAsync(tab, url, cancellationToken);
+    }
 
-        await CdpAsync("Page.navigate", JsonParameters(new { url }), cancellationToken);
+    private static bool SameUrl(string left, string right) =>
+        Uri.TryCreate(left, UriKind.Absolute, out var a)
+        && Uri.TryCreate(right, UriKind.Absolute, out var b)
+        && a.Equals(b);
+
+    private async Task<string> NavigateTabAsync(BrowserTab tab, string url, CancellationToken cancellationToken)
+    {
+        var load = tab.BeginLoadWait();
+
+        await CallTabCdpAsync(tab, "Page.navigate", JsonParameters(new { url }));
 
         var finished = await Task.WhenAny(load.Task, Task.Delay(LoadTimeout, cancellationToken));
         if (finished == load.Task) return url;
 
         // 只有确实还是自己挂的那个等待时才清理，避免误伤后续导航。
-        Interlocked.CompareExchange(ref _pendingLoad, null, load);
+        tab.AbandonLoadWait(load);
         return $"{url}（已发出导航，但 {LoadTimeout.TotalSeconds:0} 秒内没有收到 load 事件；页面可能仍在加载，可用 console 或 evaluate 继续观察）";
     }
 
-    /// <summary>重新加载当前页面并等待 load 事件。</summary>
+    /// <summary>重新加载活动标签并等待 load 事件。</summary>
     public async Task<string> ReloadAsync(bool ignoreCache, CancellationToken cancellationToken = default)
     {
-        await EnsureBrowserAsync(cancellationToken);
+        var tab = await EnsureActiveTabAsync(cancellationToken);
 
-        var load = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        Interlocked.Exchange(ref _pendingLoad, load);
+        var load = tab.BeginLoadWait();
 
-        await CdpAsync("Page.reload", JsonParameters(new { ignoreCache }), cancellationToken);
+        await CallTabCdpAsync(tab, "Page.reload", JsonParameters(new { ignoreCache }));
 
         var finished = await Task.WhenAny(load.Task, Task.Delay(LoadTimeout, cancellationToken));
         return finished == load.Task ? "已重新加载" : "已发出重新加载，但未在超时内收到 load 事件";
     }
 
-    /// <summary>调用任意 DevTools Protocol 方法，返回原始 JSON 响应。</summary>
+    /// <summary>调用任意 DevTools Protocol 方法（作用于活动标签），返回原始 JSON 响应。</summary>
     public async Task<string> CdpAsync(string method, string parametersJson, CancellationToken cancellationToken = default)
     {
-        await EnsureBrowserAsync(cancellationToken);
-        return await AwaitWithTimeout(CallCoreAsync(method, parametersJson), CallTimeout, method);
+        var tab = await EnsureActiveTabAsync(cancellationToken);
+        return await AwaitWithTimeout(CallTabCdpAsync(tab, method, parametersJson), CallTimeout, method);
     }
 
-    /// <summary>读宿主内累积的 console/异常记录；代理会话经管道转发到这里。</summary>
-    public Task<string> ReadConsoleAsync(bool clear, CancellationToken cancellationToken = default) =>
-        Task.FromResult(_console.Render(clear));
+    /// <summary>读活动标签累积的 console/异常记录；代理会话经管道转发到这里。</summary>
+    public async Task<string> ReadConsoleAsync(bool clear, CancellationToken cancellationToken = default)
+    {
+        var tab = await EnsureActiveTabAsync(cancellationToken);
+        return tab.Console.Render(clear);
+    }
 
-    /// <summary>读宿主内累积的网络记录；代理会话经管道转发到这里。</summary>
-    public Task<string> ReadNetworkAsync(bool clear, CancellationToken cancellationToken = default) =>
-        Task.FromResult(_network.Render(clear));
+    /// <summary>读活动标签累积的网络记录；代理会话经管道转发到这里。</summary>
+    public async Task<string> ReadNetworkAsync(bool clear, CancellationToken cancellationToken = default)
+    {
+        var tab = await EnsureActiveTabAsync(cancellationToken);
+        return tab.Network.Render(clear);
+    }
 
-    /// <summary>直接投递到 UI 线程的内部调用，供启动阶段使用（那时还没法走 EnsureBrowserAsync）。</summary>
-    private Task<string> CallCoreAsync(string method, string parametersJson)
+    private Task<string> CallTabCdpAsync(BrowserTab tab, string method, string parametersJson)
     {
         var dispatcher = _dispatcher ?? throw new InvalidOperationException("UI 线程尚未启动");
         return dispatcher
-            .InvokeAsync(() => _core!.CallDevToolsProtocolMethodAsync(method, parametersJson))
+            .InvokeAsync(() =>
+            {
+                var core = tab.Core ?? throw new InvalidOperationException("标签页尚未就绪");
+                return core.CallDevToolsProtocolMethodAsync(method, parametersJson);
+            })
             .Task
             .Unwrap();
     }
@@ -324,64 +483,98 @@ internal sealed class WebViewHost : IBrowserHost, IDisposable
         Console.Error.Flush();
     }
 
-    private void SubscribeProtocolEvents()
+    /// <summary>UI 触发的异步动作（导航、刷新、开标签）：失败只记日志，不能把窗口打崩。</summary>
+    private static void FireAndForget(Func<Task> action, string what)
     {
-        // console.* 走 Runtime 域；浏览器自身产生的安全/CSP/网络告警走 Log 域。两者互补，都要订阅。
-        Subscribe("Runtime.consoleAPICalled", _console.OnConsoleApiCalled);
-        Subscribe("Runtime.exceptionThrown", _console.OnExceptionThrown);
-        Subscribe("Log.entryAdded", _console.OnLogEntryAdded);
+        _ = RunAsync(action, what);
 
-        Subscribe("Network.requestWillBeSent", _network.OnRequestWillBeSent);
-        Subscribe("Network.responseReceived", _network.OnResponseReceived);
-        Subscribe("Network.loadingFailed", _network.OnLoadingFailed);
-
-        Subscribe("Page.loadEventFired", _ => OnLoadEventFired());
-        Subscribe("Page.frameNavigated", OnFrameNavigated);
-    }
-
-    private void Subscribe(string eventName, Action<string> handler)
-    {
-        var receiver = _core!.GetDevToolsProtocolEventReceiver(eventName);
-        receiver.DevToolsProtocolEventReceived += (_, args) =>
+        static async Task RunAsync(Func<Task> action, string what)
         {
-            // 单个畸形事件不应该拖垮整个会话，所以这里吞掉解析异常。
             try
             {
-                handler(args.ParameterObjectAsJson);
+                await action();
             }
-            catch
+            catch (Exception exception)
             {
-                // 忽略
+                LogError(what, exception);
             }
-        };
-
-        // 关键：保住引用，见字段声明处的说明。
-        _receivers.Add(receiver);
+        }
     }
 
-    private void OnLoadEventFired()
+    private static bool IsBlankUrl(string url) =>
+        string.Equals(url, "about:blank", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// 地址栏输入归一化：补协议头。本机调试占绝大多数，所以 localhost / IP 走 http，
+    /// 其余补 https；已有协议（含 about:/data:/file: 等）原样保留。
+    /// </summary>
+    private static string NormalizeAddress(string text)
     {
-        var pending = Interlocked.Exchange(ref _pendingLoad, null);
-        pending?.TrySetResult();
+        var trimmed = (text ?? string.Empty).Trim();
+        if (trimmed.Length == 0) return "about:blank";
+        if (trimmed.Contains("://", StringComparison.Ordinal)) return trimmed;
+
+        foreach (var scheme in new[] { "about:", "data:", "file:", "javascript:", "mailto:" })
+        {
+            if (trimmed.StartsWith(scheme, StringComparison.OrdinalIgnoreCase)) return trimmed;
+        }
+
+        var host = trimmed.Split('/', 2)[0].Split(':', 2)[0];
+        if (host.Equals("localhost", StringComparison.OrdinalIgnoreCase) || IPAddress.TryParse(host, out _))
+            return "http://" + trimmed;
+
+        return "https://" + trimmed;
     }
 
-    private void OnFrameNavigated(string payloadJson)
+    string IBrowserWindowActions.ActiveUrl => _activeTab?.Url ?? "about:blank";
+
+    void IBrowserWindowActions.ActivateTab(BrowserTab tab) => ActivateTabCore(tab);
+
+    void IBrowserWindowActions.CloseTab(BrowserTab tab) => CloseTabCore(tab);
+
+    void IBrowserWindowActions.CloseActiveTab()
     {
+        if (_activeTab is { } tab) CloseTabCore(tab);
+    }
+
+    void IBrowserWindowActions.OpenNewTab() =>
+        FireAndForget(() => CreateTabAsync(DefaultHomeUrl), "新建标签页");
+
+    void IBrowserWindowActions.NavigateFromAddressBar(string text)
+    {
+        var url = NormalizeAddress(text);
+        FireAndForget(() => NavigateAsync(url), "地址栏导航");
+    }
+
+    void IBrowserWindowActions.GoBack()
+    {
+        if (_activeTab?.Core is { CanGoBack: true } core) core.GoBack();
+    }
+
+    void IBrowserWindowActions.GoForward()
+    {
+        if (_activeTab?.Core is { CanGoForward: true } core) core.GoForward();
+    }
+
+    void IBrowserWindowActions.ReloadActiveTab(bool ignoreCache) =>
+        FireAndForget(() => ReloadAsync(ignoreCache), "刷新页面");
+
+    void IBrowserWindowActions.OpenDevTools()
+    {
+        var core = _activeTab?.Core;
+        if (core is null) return;
+
         try
         {
-            using var document = System.Text.Json.JsonDocument.Parse(payloadJson);
-            if (!document.RootElement.TryGetProperty("frame", out var frame)) return;
-            if (!frame.TryGetProperty("url", out var url)) return;
-
-            var value = url.GetString();
-            if (string.IsNullOrEmpty(value) || _window is null) return;
-            _window.Title = $"BrowserDebugMCP — {value}";
+            core.OpenDevToolsWindow();
         }
-        catch
+        catch (Exception exception)
         {
-            // 忽略
+            LogError("打开开发工具", exception);
         }
     }
+
+    void IBrowserWindowActions.FocusActivePage() => _activeTab?.WebView.Focus();
 
     public void Dispose()
     {
