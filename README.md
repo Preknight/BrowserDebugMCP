@@ -99,6 +99,26 @@ command = "C:\\path\\to\\BrowserDebugMCP\\bin\\Release\\net10.0-windows\\Browser
 
 ## 运行时行为
 
+### 单实例：一个宿主，多个会话共享
+
+同一个登录会话里，无论有多少个 MCP 客户端（Reasonix 会话、子 Agent、其他客户端进程），**只有一个进程真正持有 WebView2**：
+
+| 角色 | 怎么产生 | 行为 |
+| --- | --- | --- |
+| **宿主** | 第一个启动、抢到命名互斥量 `Local\BrowserDebugMCP.Host` 的进程 | 创建 `WebViewHost`（仍按需懒建窗口），并在命名管道 `BrowserDebugMCP.Host.<用户名>` 上服务 |
+| **代理** | 其余进程（互斥量已存在） | 不建浏览器，把每次工具调用经管道转发给宿主；仍是 stdio MCP 服务器，客户端无感 |
+| **接管** | 宿主随它所属的会话一起退出后，代理的下一次调用发现连接断开且互斥量已释放 | 该代理升级为宿主并重建浏览器（页面状态丢失） |
+
+所有调用——宿主自己的 MCP 工具调用与所有代理请求——都经过同一把全局串行锁，因此**同一时刻只有一个调用在操作浏览器**。
+
+**多个 Agent 同时使用时的语义**：
+
+- 支持并发调用：请求排队执行，不会出现两个 WebView2，也不会把 CDP 调用搅乱。
+- **忙提示**：排队超过 **10 秒**（`BROWSER_DEBUG_MCP_BUSY_TIMEOUT_MS` 可调）仍未轮上时，工具直接返回错误：说明浏览器正被另一个会话占用、已占用多久，并明确要求**不要轮询或连续重试**。这样调用方不会在共享浏览器上反复空转。
+- **页面状态不隔离**：一个 Agent 的 `open` 会把浏览器导航走，别的 Agent 随后的 `evaluate` / `dom` / `screenshot` 看到的是别人的页面；`console` / `network` 读到的也是宿主的共享缓冲。
+- `close_window`、`resize_window`、`screenshot_window` 作用在同一个窗口上，对所有 Agent 生效。
+- 需要"每个 Agent 独立页面"时不要用单实例共享：那需要按会话分配独立 WebView2（当前未实现）。
+
 ### 两层生命周期（刻意设计）
 
 | 层 | 生命周期 |
@@ -112,6 +132,7 @@ command = "C:\\path\\to\\BrowserDebugMCP\\bin\\Release\\net10.0-windows\\Browser
 - 窗口尺寸：默认 **1280×880**（WPF DIP，含窗口边框，所以页面视口会小一圈），可用 `resize_window` 调整。调过的尺寸在窗口被关掉重建后**继续沿用**（仅限当前进程）；进程重启则回到默认值。
 - 浏览器数据目录：**实测落在 exe 同级的 `BrowserDebugMCP.exe.WebView2\`**（WebView2 在 WPF 宿主下的默认位置）。代码里虽然显式调了 `CoreWebView2Environment.CreateAsync(userDataFolder: ...)`，但该参数在当前 WPF 路径下**未生效**，所以 `BROWSER_DEBUG_MCP_USER_DATA` 实际不起作用。好在默认位置同样在 exe 同级，不会碰你日常浏览器的 profile。
 - 截图目录：exe 同级 `screenshots\`，可用 `BROWSER_DEBUG_MCP_SCREENSHOT_DIR` 改写（这一项有效）。`screenshot` 生成 `shot-<时间戳>.png`，`screenshot_window` 生成 `window-<时间戳>.png`。
+- 排队上限：`BROWSER_DEBUG_MCP_BUSY_TIMEOUT_MS`（默认 `10000`）。多个 Agent 共享浏览器时，等锁超过这个时长会返回“正被其他会话占用、不要轮询”的错误，而不是继续挂着。
 - 两个目录都在 `bin\...` 里面，`dotnet clean` 会一并清掉；需要留存截图请用上面的环境变量改到别处。
 
 ## 代码里已经规避的坑
@@ -146,6 +167,7 @@ command = "C:\\path\\to\\BrowserDebugMCP\\bin\\Release\\net10.0-windows\\Browser
 构建与安装：
 
 - `dotnet build -c Debug` → **0 警告 / 0 错误**；`dotnet build -c Release -t:Compile` 同样 **0 警告 / 0 错误**（Release 的 exe 复制被正在运行的 MCP 进程锁定，需重启会话后重跑 `dotnet build -c Release`）。
+- 单实例改造（宿主/代理 + 命名管道）同样是 Debug 与 Release Compile 均 **0 警告 / 0 错误**，但**尚未做多进程实调**：需要两个以上会话同时连上，观察日志里的“宿主 / 代理”角色、停掉宿主会话后代理接管，以及并发调用排队。
 - 新增 `resize_window` 前，作为 MCP 服务器安装后客户端枚举到 **12 个工具**，全部可用；加入 `resize_window` 与 `screenshot_window` 后应为 **14 个**，尚未在客户端重新枚举。
 
 端到端实调（经 MCP 通道，非本地模拟）：
@@ -169,7 +191,12 @@ command = "C:\\path\\to\\BrowserDebugMCP\\bin\\Release\\net10.0-windows\\Browser
 | 文件 | 职责 |
 | --- | --- |
 | `BrowserDebugMCP.csproj` | `net10.0-windows` + `UseWPF`，三个包引用 |
-| `Program.cs` | MCP host、日志导 stderr、目录派生 |
+| `Program.cs` | MCP host、单实例角色选择、日志导 stderr、目录派生 |
+| `BrowserHost.cs` | `IBrowserHost` 后端接口与宿主业务错误类型 |
+| `BrowserGateway.cs` | 单实例角色选举、宿主接管、全局串行锁 |
+| `SingleInstanceHost.cs` | 宿主侧命名管道服务端（一连接一处理） |
+| `RemoteBrowserHost.cs` | 代理侧命名管道客户端（请求/响应配对、断线重连） |
+| `BrowserIpc.cs` | 宿主与代理之间的 JSON 行协议与分发 |
 | `WebViewHost.cs` | STA UI 线程、WebView2 生命周期、窗口尺寸与抓图入口、CDP 调用与事件订阅、导航等待 |
 | `WindowCapture.cs` | Win32 抓窗口像素（`PrintWindow` / `BitBlt` → PNG） |
 | `ConsoleBuffer.cs` | console / 异常 / 浏览器告警的累积与渲染 |

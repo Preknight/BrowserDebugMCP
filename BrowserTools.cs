@@ -51,16 +51,18 @@ internal sealed class BrowserTools(BrowserSession session)
     }
 
     [McpServerTool(Name = "console")]
-    [Description("读取页面累积的 console 输出、未捕获异常与浏览器自身告警（CSP、混合内容、资源加载失败等）。")]
-    public string ReadConsole(
-        [Description("读取后是否清空缓冲，默认 false")] bool clear = false) =>
-        session.Console.Render(clear);
+    [Description("读取页面累积的 console 输出、未捕获异常与浏览器自身告警（CSP、混合内容、资源加载失败等）。多会话共享同一浏览器时，读的是宿主进程的缓冲。")]
+    public Task<string> ReadConsole(
+        [Description("读取后是否清空缓冲，默认 false")] bool clear = false,
+        CancellationToken cancellationToken = default) =>
+        session.Host.ReadConsoleAsync(clear, cancellationToken);
 
     [McpServerTool(Name = "network")]
-    [Description("读取页面累积的网络请求记录：状态码、方法、URL、资源类型，以及失败原因。")]
-    public string ReadNetwork(
-        [Description("读取后是否清空记录，默认 false")] bool clear = false) =>
-        session.Network.Render(clear);
+    [Description("读取页面累积的网络请求记录：状态码、方法、URL、资源类型，以及失败原因。多会话共享同一浏览器时，读的是宿主进程的记录。")]
+    public Task<string> ReadNetwork(
+        [Description("读取后是否清空记录，默认 false")] bool clear = false,
+        CancellationToken cancellationToken = default) =>
+        session.Host.ReadNetworkAsync(clear, cancellationToken);
 
     [McpServerTool(Name = "dom")]
     [Description("取当前文档（或某个元素）的 outerHTML。用于确认前端渲染出来的真实结构。")]

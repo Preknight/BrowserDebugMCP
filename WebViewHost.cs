@@ -15,7 +15,7 @@ namespace BrowserDebugMCP;
 /// - **浏览器窗口按需创建**：进程启动时不建窗口；第一次工具调用才建；
 ///   用户把窗口关掉就彻底销毁它（释放 WebView2 资源），进程继续待命，下次调用再建。
 /// </summary>
-internal sealed class WebViewHost : IDisposable
+internal sealed class WebViewHost : IBrowserHost, IDisposable
 {
     private static readonly TimeSpan LoadTimeout = TimeSpan.FromSeconds(20);
     private static readonly TimeSpan CallTimeout = TimeSpan.FromSeconds(60);
@@ -289,6 +289,14 @@ internal sealed class WebViewHost : IDisposable
         await EnsureBrowserAsync(cancellationToken);
         return await AwaitWithTimeout(CallCoreAsync(method, parametersJson), CallTimeout, method);
     }
+
+    /// <summary>读宿主内累积的 console/异常记录；代理会话经管道转发到这里。</summary>
+    public Task<string> ReadConsoleAsync(bool clear, CancellationToken cancellationToken = default) =>
+        Task.FromResult(_console.Render(clear));
+
+    /// <summary>读宿主内累积的网络记录；代理会话经管道转发到这里。</summary>
+    public Task<string> ReadNetworkAsync(bool clear, CancellationToken cancellationToken = default) =>
+        Task.FromResult(_network.Render(clear));
 
     /// <summary>直接投递到 UI 线程的内部调用，供启动阶段使用（那时还没法走 EnsureBrowserAsync）。</summary>
     private Task<string> CallCoreAsync(string method, string parametersJson)
